@@ -25,7 +25,7 @@ type Options = {
 }
 
 type WorkerSlot = {
-	worker: Omit<Worker, 'terminate'>
+	worker: Promise<Omit<Worker, 'terminate'>>
 	idle: PromiseWithResolvers<WorkerSlot>
 	terminate: (reason: string) => void
 	terminated: Promise<string>
@@ -48,13 +48,13 @@ export type Result<T, E> =
 	| Failure<E>
 
 export class WorkerRunner<Input, Output> {
-	#createWorker: () => Worker
+	#createWorker: () => Worker | Promise<Worker>
 	#options: Options
 
 	#slots: WorkerSlot[] = []
 	#id = 0
 
-	constructor(createWorker: () => Worker, options: Options) {
+	constructor(createWorker: () => Worker | Promise<Worker>, options: Options) {
 		this.#createWorker = createWorker
 		this.#options = options
 	}
@@ -95,7 +95,7 @@ export class WorkerRunner<Input, Output> {
 		slot.idleTimeout = null
 		slot.state = 'busy'
 
-		const { worker } = slot
+		const worker = await slot.worker
 		const kind = 'io'
 		worker.postMessage({ id, kind, input })
 
@@ -151,14 +151,14 @@ export class WorkerRunner<Input, Output> {
 	}
 
 	#addWorkerSlot(): WorkerSlot {
-		const worker = this.#createWorker()
+		const worker = Promise.resolve(this.#createWorker())
 		const terminated = Promise.withResolvers<string>()
 
 		const slot: WorkerSlot = {
 			worker,
 			idle: Promise.withResolvers(),
-			terminate: (reason) => {
-				worker.terminate()
+			terminate: async (reason) => {
+				;(await worker).terminate()
 				terminated.resolve(reason)
 				const index = this.#slots.indexOf(slot)
 				if (index !== -1) {
