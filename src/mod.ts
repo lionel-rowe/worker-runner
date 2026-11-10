@@ -59,6 +59,14 @@ export class WorkerRunner<Input, Output> {
 		this.#options = options
 	}
 
+	warmup(numWorkers = 1) {
+		for (let i = 0; i < numWorkers; i++) {
+			if (this.#slots.length < this.#options.maxWorkers) {
+				this.#addWorkerSlot()
+			} else break
+		}
+	}
+
 	async call(input: Input): Promise<Result<Output, WorkerRunnerError>> {
 		const id = this.#id++
 
