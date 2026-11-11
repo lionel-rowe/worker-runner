@@ -1,27 +1,13 @@
+import { IoError, IoMessageError, StaleInputError, TerminatedError, WorkerRunnerError } from './errors.ts'
+export * from './errors.ts'
+
 const I32_MAX = 2 ** 31 - 1
 
-export abstract class WorkerRunnerError extends Error {}
-
-export class IoError extends WorkerRunnerError {
-	override readonly name = this.constructor.name
-
-	constructor(message = '') {
-		super(message)
-	}
-}
-
-export class TerminatedError extends WorkerRunnerError {
-	override readonly name = this.constructor.name
-
-	constructor(message = '') {
-		super(message)
-	}
-}
-
-type Options = {
+export type Options<I, O> = {
 	maxWorkers: number
 	idleTimeoutMs: number
-	cullStale: boolean
+	skipStale: boolean
+	matches?: (input: I, output: O) => boolean
 }
 
 type WorkerSlot = {
@@ -47,14 +33,16 @@ export type Result<T, E> =
 	| Success<T>
 	| Failure<E>
 
-export class WorkerRunner<Input, Output> {
+export class WorkerRunner<I, O> {
 	#createWorker: () => Worker | Promise<Worker>
-	#options: Options
-
+	#options: Options<I, O>
 	#slots: WorkerSlot[] = []
-	#id = 0
 
-	constructor(createWorker: () => Worker | Promise<Worker>, options: Options) {
+	#matches(input: I, output: O) {
+		return this.#options.matches?.(input, output) ?? true
+	}
+
+	constructor(createWorker: () => Worker | Promise<Worker>, options: Options<I, O>) {
 		this.#createWorker = createWorker
 		this.#options = options
 	}
@@ -67,19 +55,25 @@ export class WorkerRunner<Input, Output> {
 		}
 	}
 
-	async call(input: Input): Promise<Result<Output, WorkerRunnerError>> {
-		const id = this.#id++
+	#i = -1
+
+	async call(input: I): Promise<Result<O, WorkerRunnerError>> {
+		const i = ++this.#i
 
 		let slot: WorkerSlot
 		if (this.#slots.length < this.#options.maxWorkers) {
-			slot = this.#addWorkerSlot()
-		} else if (this.#options.cullStale) {
-			this.#cullStale()
 			slot = this.#addWorkerSlot()
 		} else {
 			while (true) {
 				slot = await this.#nextIdle()
 				if (slot.state === 'idle') break
+			}
+
+			if (this.#options.skipStale && i !== this.#i) {
+				return {
+					ok: false,
+					error: new StaleInputError('Discarded stale input'),
+				}
 			}
 		}
 
@@ -96,13 +90,12 @@ export class WorkerRunner<Input, Output> {
 		slot.state = 'busy'
 
 		const worker = await slot.worker
-		const kind = 'io'
-		worker.postMessage({ id, kind, input })
+		worker.postMessage(input)
 
 		const ac = new AbortController()
 		const { signal } = ac
 
-		return new Promise<Result<Output, WorkerRunnerError>>((res) => {
+		return new Promise<Result<O, WorkerRunnerError>>((res) => {
 			slot.terminated.then((reason) => {
 				res({ ok: false, error: new TerminatedError(reason) })
 				ac.abort()
@@ -114,12 +107,12 @@ export class WorkerRunner<Input, Output> {
 			}, { signal })
 
 			worker.addEventListener('messageerror', () => {
-				res({ ok: false, error: new IoError('Message error') })
+				res({ ok: false, error: new IoMessageError('Message error') })
 				ac.abort()
 			}, { signal })
 
 			worker.addEventListener('message', (e) => {
-				if (e.data.kind === 'io' && e.data.id === id) {
+				if (this.#matches(input, e.data)) {
 					clearTimeout(slot.idleTimeout ?? -1)
 					slot.idleTimeout = setTimeoutI32Safe(() => {
 						slot.terminate('Idle timeout')
@@ -128,22 +121,11 @@ export class WorkerRunner<Input, Output> {
 					slot.idle = Promise.withResolvers()
 					slot.state = 'idle'
 
-					res({ ok: true, value: e.data.output })
+					res({ ok: true, value: e.data })
 					ac.abort()
 				}
 			}, { signal })
 		})
-	}
-
-	#cullStale() {
-		let i = 0
-		const slots = this.#slots.filter((x) => x.state === 'busy')
-		for (const slot of slots) {
-			// make sure not to terminate latest (assume most recent)
-			if (i++ % 2 === slots.length % 2) {
-				slot.terminate('Removed stale')
-			}
-		}
 	}
 
 	#nextIdle(): Promise<WorkerSlot> {
@@ -158,7 +140,7 @@ export class WorkerRunner<Input, Output> {
 			worker,
 			idle: Promise.withResolvers(),
 			terminate: async (reason) => {
-				;(await worker).terminate()
+				void (await worker).terminate()
 				terminated.resolve(reason)
 				const index = this.#slots.indexOf(slot)
 				if (index !== -1) {

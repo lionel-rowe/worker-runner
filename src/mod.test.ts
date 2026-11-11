@@ -1,118 +1,103 @@
 import { assertEquals } from '@std/assert'
-import type { Result } from './mod.ts'
-import { TerminatedError, WorkerRunner, WorkerRunnerError } from './mod.ts'
+import { StaleInputError, WorkerRunner, WorkerRunnerError } from './mod.ts'
 
-/** A crap PRNG */
-function prng(seed: number) {
-	return () => {
-		// Take the sine, multiply to shift decimals, and grab the fractional part
-		const x = Math.sin(seed++) * 10_000
-		return x - Math.floor(x)
-	}
-}
+type Input = { input: string; timeout: number }
 
-function testWorkerFn(seed: number) {
-	const random = prng(seed)
-
+function testWorkerFn() {
 	// deno-lint-ignore no-explicit-any
 	const self = globalThis as any
-	// deno-lint-ignore no-explicit-any
-	self.addEventListener('message', async (e: any) => {
-		const { input, id } = e.data
-		await new Promise((res) => setTimeout(res, 2000 * random()))
-		self.postMessage({ id, input, output: input.toUpperCase(), kind: 'io' })
+	self.addEventListener('message', (e: { data: Input }) => {
+		const { input, timeout } = e.data
+
+		// blocking wait
+		const start = Date.now()
+		while (Date.now() - start < timeout);
+
+		self.postMessage(input.toUpperCase())
 	})
 }
 
-const seed = 2068369795
-
-class TestWorkerCreator {
-	seed: number
-	constructor(seed: number) {
-		this.seed = seed
-		this.createWorker = this.createWorker.bind(this)
-	}
-	createWorker() {
-		return new Worker(
-			`data:text/javascript,${encodeURIComponent(`${prng}; (${testWorkerFn})(${this.seed})`)}`,
-			{ type: 'module' },
-		)
-	}
+function createWorker() {
+	return new Worker(
+		`data:text/javascript,${encodeURIComponent(`(${testWorkerFn})()`)}`,
+		{ type: 'module' },
+	)
 }
 
 Deno.test(WorkerRunner.name, async (t) => {
 	await t.step('basic functionality', async () => {
-		const { createWorker } = new TestWorkerCreator(seed)
-
-		const runner = new WorkerRunner<string, string>(createWorker, {
+		const runner = new WorkerRunner<Input, string>(createWorker, {
 			maxWorkers: 2,
 			idleTimeoutMs: 100,
-			cullStale: false,
+			skipStale: false,
 		})
 
 		await assertResultsEqual(
 			runner,
-			['abc', 'def', 'ghi', 'xyz'],
 			[
-				{ ok: true, value: 'ABC' },
-				{ ok: true, value: 'DEF' },
-				{ ok: true, value: 'GHI' },
-				{ ok: true, value: 'XYZ' },
+				'a',
+				{ input: 'b', timeout: 100 },
+				'c',
+				'd',
+			],
+			[
+				'A',
+				'B',
+				'C',
+				'D',
 			],
 		)
 	})
 
-	await t.step('cullStale', async () => {
-		const { createWorker } = new TestWorkerCreator(seed)
+	const SKIP_STALE = { skipStale: true }
 
-		const runner = new WorkerRunner<string, string>(createWorker, {
+	await t.step(Object.keys(SKIP_STALE)[0]!, async () => {
+		const runner = new WorkerRunner<Input, string>(createWorker, {
 			maxWorkers: 2,
 			idleTimeoutMs: 100,
-			cullStale: true,
+			...SKIP_STALE,
 		})
 
 		await assertResultsEqual(
 			runner,
-			['abc', 'def', 'ghi'],
 			[
-				{ ok: false, error: new TerminatedError('Removed stale') },
-				{ ok: true, value: 'DEF' },
-				{ ok: true, value: 'GHI' },
+				{ input: 'a', timeout: 100 },
+				'b',
+				'c',
+				'd',
+				'e',
+				'f',
 			],
-		)
-
-		await assertResultsEqual(
-			runner,
-			['abc', 'def', 'ghi', 'xyz'],
 			[
-				{ ok: false, error: new TerminatedError('Removed stale') },
-				{ ok: false, error: new TerminatedError('Removed stale') },
-				{ ok: true, value: 'GHI' },
-				{ ok: true, value: 'XYZ' },
+				'A',
+				'B',
+				new StaleInputError('Discarded stale input'),
+				new StaleInputError('Discarded stale input'),
+				new StaleInputError('Discarded stale input'),
+				'F',
 			],
 		)
 	})
 })
 
-async function assertResultsEqual<I, O>(
-	runner: WorkerRunner<I, O>,
-	inputs: I[],
-	expected: Result<O, WorkerRunnerError>[],
+async function assertResultsEqual(
+	runner: WorkerRunner<Input, string>,
+	inputs: (string | Input)[],
+	expected: (string | WorkerRunnerError)[],
 ) {
-	const actual = await Promise.all(inputs.map((input) => runner.call(input)))
-	assertEquals(actual.length, expected.length)
+	const actual = await Promise.all(inputs.map(async (x) => {
+		const val = await runner.call(
+			typeof x === 'string' ? { input: x, timeout: 0 } : x,
+		)
 
-	for (let i = 0; i < actual.length; ++i) {
-		const a = actual[i]!
-		const e = expected[i]!
+		return val.ok ? val.value : val.error
+	}))
 
-		if (a.ok && e.ok) {
-			assertEquals(a.value, e.value)
-		} else if (!a.ok && !e.ok) {
-			assertEquals(a.error.constructor, e.error.constructor)
-			assertEquals(a.error.message, e.error.message)
-		} else {
-			assertEquals(a, e)
+	for (const x of [...actual, ...expected]) {
+		if (Error.isError(x)) {
+			x.stack = x.stack?.replace(/(\n\s+at )[^]*/, '$1<truncated trace>')
 		}
 	}
+
+	assertEquals(actual, expected)
 }
