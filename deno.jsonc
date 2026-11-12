@@ -1,10 +1,11 @@
 {
 	"lock": false,
-	// "name": "@li/worker-runner",
-	// "version": "0.0.0",
-	// "exports": {
-	// 	".": "./src/mod.ts"
-	// },
+	"name": "@li/worker-runner",
+	"version": "0.0.0",
+	"license": "MIT",
+	"exports": {
+		".": "./src/mod.ts"
+	},
 	"tasks": {
 		"test": "deno test -R"
 	},
