@@ -30,7 +30,7 @@ Deno.test(WorkerRunner.name, async (t) => {
 		const runner = new WorkerRunner<Input, string>(createWorker, {
 			maxWorkers: 2,
 			idleTimeoutMs: 100,
-			skipStale: false,
+			invalidateStale: false,
 		})
 
 		await assertResultsEqual(
@@ -44,13 +44,13 @@ Deno.test(WorkerRunner.name, async (t) => {
 		)
 	})
 
-	const SKIP_STALE = { skipStale: true }
+	const INVALIDATE_STALE = { invalidateStale: true }
 
-	await t.step(Object.keys(SKIP_STALE)[0]!, async () => {
+	await t.step(Object.keys(INVALIDATE_STALE)[0]!, async () => {
 		const runner = new WorkerRunner<Input, string>(createWorker, {
 			maxWorkers: 2,
 			idleTimeoutMs: 100,
-			...SKIP_STALE,
+			...INVALIDATE_STALE,
 		})
 
 		await assertResultsEqual(

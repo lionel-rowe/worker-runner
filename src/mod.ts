@@ -7,8 +7,8 @@ const I32_MAX = 2 ** 31 - 1
 export type WorkerRunnerOptions<I, O> = {
 	maxWorkers: number
 	idleTimeoutMs: number
-	skipStale: boolean
-	matches?: (input: I, output: O) => boolean
+	invalidateStale: boolean
+	matches(input: I, output: O): boolean
 }
 
 export class WorkerRunner<I, O> {
@@ -16,13 +16,16 @@ export class WorkerRunner<I, O> {
 	#options: WorkerRunnerOptions<I, O>
 	#slots: WorkerSlot[] = []
 
-	#matches(input: I, output: O) {
-		return this.#options.matches?.(input, output) ?? true
-	}
-
-	constructor(createWorker: () => Worker | Promise<Worker>, options: WorkerRunnerOptions<I, O>) {
+	constructor(createWorker: () => Worker | Promise<Worker>, options?: Partial<WorkerRunnerOptions<I, O>>) {
 		this.#createWorker = createWorker
-		this.#options = options
+		const matches = options?.matches?.bind(options) ?? (() => true)
+		this.#options = {
+			maxWorkers: 5,
+			idleTimeoutMs: 30_000,
+			invalidateStale: false,
+			...options,
+			matches,
+		}
 	}
 
 	warmup(numWorkers = 1) {
@@ -55,7 +58,7 @@ export class WorkerRunner<I, O> {
 
 			const candidate = await this.#nextCandidate()
 
-			if (this.#options.skipStale && i !== this.#i) {
+			if (this.#options.invalidateStale && i !== this.#i) {
 				throw new StaleInputError('Discarded stale input')
 			}
 
@@ -94,7 +97,7 @@ export class WorkerRunner<I, O> {
 			}, { signal })
 
 			worker.addEventListener('message', (e) => {
-				if (this.#matches(input, e.data)) {
+				if (this.#options.matches(input, e.data)) {
 					slot.state = 'idle'
 					slot.idle.resolve(slot)
 					slot.idle = Promise.withResolvers()
