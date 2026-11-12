@@ -1,22 +1,14 @@
-import { IoError, IoMessageError, StaleInputError, TerminatedError, WorkerRunnerError } from './errors.ts'
+import { StaleInputError, TerminatedError, WorkerError, WorkerMessageError, WorkerRunnerError } from './errors.ts'
+import { WorkerSlot } from './slot.ts'
 export * from './errors.ts'
 
 const I32_MAX = 2 ** 31 - 1
 
-export type Options<I, O> = {
+export type WorkerRunnerOptions<I, O> = {
 	maxWorkers: number
 	idleTimeoutMs: number
 	skipStale: boolean
 	matches?: (input: I, output: O) => boolean
-}
-
-type WorkerSlot = {
-	worker: Promise<Omit<Worker, 'terminate'>>
-	idle: PromiseWithResolvers<WorkerSlot>
-	terminate: (reason: string) => void
-	terminated: Promise<string>
-	idleTimeout: number | null
-	state: 'idle' | 'busy'
 }
 
 type Success<T> = {
@@ -35,39 +27,47 @@ export type Result<T, E> =
 
 export class WorkerRunner<I, O> {
 	#createWorker: () => Worker | Promise<Worker>
-	#options: Options<I, O>
+	#options: WorkerRunnerOptions<I, O>
 	#slots: WorkerSlot[] = []
 
 	#matches(input: I, output: O) {
 		return this.#options.matches?.(input, output) ?? true
 	}
 
-	constructor(createWorker: () => Worker | Promise<Worker>, options: Options<I, O>) {
+	constructor(createWorker: () => Worker | Promise<Worker>, options: WorkerRunnerOptions<I, O>) {
 		this.#createWorker = createWorker
 		this.#options = options
 	}
 
 	warmup(numWorkers = 1) {
-		for (let i = 0; i < numWorkers; i++) {
-			if (this.#slots.length < this.#options.maxWorkers) {
-				this.#addWorkerSlot()
-			} else break
+		for (let i = this.#slots.length; i < numWorkers; ++i) {
+			this.#addWorkerSlot()
+		}
+	}
+
+	async terminateAll() {
+		for (const slot of [...this.#slots]) {
+			await slot.terminate('Terminate all')
 		}
 	}
 
 	#i = -1
-
 	async call(input: I): Promise<Result<O, WorkerRunnerError>> {
 		const i = ++this.#i
 
 		let slot: WorkerSlot
-		if (this.#slots.length < this.#options.maxWorkers) {
-			slot = this.#addWorkerSlot()
-		} else {
-			while (true) {
-				slot = await this.#nextIdle()
-				if (slot.state === 'idle') break
+		while (true) {
+			const idleSlot = this.#slots.find((x) => x.state === 'idle')
+			if (idleSlot) {
+				slot = idleSlot
+				break
 			}
+			if (this.#slots.length < this.#options.maxWorkers) {
+				slot = this.#addWorkerSlot()
+				break
+			}
+
+			const candidate = await this.#nextCandidate()
 
 			if (this.#options.skipStale && i !== this.#i) {
 				return {
@@ -75,21 +75,18 @@ export class WorkerRunner<I, O> {
 					error: new StaleInputError('Discarded stale input'),
 				}
 			}
-		}
 
-		// Move the selected slot to the end of the array to mark it as most recently used
-		this.#slots.push(
-			...this.#slots.splice(
-				this.#slots.indexOf(slot),
-				1,
-			),
-		)
+			if (candidate.state === 'idle') {
+				slot = candidate
+				break
+			}
+		}
 
 		clearTimeout(slot.idleTimeout ?? -1)
 		slot.idleTimeout = null
 		slot.state = 'busy'
 
-		const worker = await slot.worker
+		const worker = await slot.getWorker()
 		worker.postMessage(input)
 
 		const ac = new AbortController()
@@ -102,24 +99,27 @@ export class WorkerRunner<I, O> {
 			})
 
 			worker.addEventListener('error', (e) => {
-				res({ ok: false, error: new IoError(e.message) })
+				res({ ok: false, error: new WorkerError(e.message) })
 				ac.abort()
+				slot.terminate('Worker error')
 			}, { signal })
 
 			worker.addEventListener('messageerror', () => {
-				res({ ok: false, error: new IoMessageError('Message error') })
+				res({ ok: false, error: new WorkerMessageError('Message error') })
 				ac.abort()
+				slot.terminate('Message error')
 			}, { signal })
 
 			worker.addEventListener('message', (e) => {
 				if (this.#matches(input, e.data)) {
+					slot.state = 'idle'
+					slot.idle.resolve(slot)
+					slot.idle = Promise.withResolvers()
+
 					clearTimeout(slot.idleTimeout ?? -1)
 					slot.idleTimeout = setTimeoutI32Safe(() => {
 						slot.terminate('Idle timeout')
 					}, this.#options.idleTimeoutMs)
-					slot.idle.resolve(slot)
-					slot.idle = Promise.withResolvers()
-					slot.state = 'idle'
 
 					res({ ok: true, value: e.data })
 					ac.abort()
@@ -128,32 +128,18 @@ export class WorkerRunner<I, O> {
 		})
 	}
 
-	#nextIdle(): Promise<WorkerSlot> {
+	#nextCandidate() {
 		return Promise.race(this.#slots.map((slot) => slot.idle.promise))
 	}
 
 	#addWorkerSlot(): WorkerSlot {
-		const worker = Promise.resolve(this.#createWorker())
-		const terminated = Promise.withResolvers<string>()
-
-		const slot: WorkerSlot = {
-			worker,
-			idle: Promise.withResolvers(),
-			terminate: async (reason) => {
-				void (await worker).terminate()
-				terminated.resolve(reason)
-				const index = this.#slots.indexOf(slot)
-				if (index !== -1) {
-					this.#slots.splice(index, 1)
-				}
-			},
-			terminated: terminated.promise,
-			idleTimeout: null,
-			state: 'idle',
-		}
+		const slot = new WorkerSlot(
+			this.#slots,
+			Promise.resolve(this.#createWorker()),
+			Promise.withResolvers(),
+		)
 
 		this.#slots.push(slot)
-
 		return slot
 	}
 }

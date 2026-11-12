@@ -1,5 +1,6 @@
 import { assertEquals } from '@std/assert'
-import { StaleInputError, WorkerRunner, WorkerRunnerError } from './mod.ts'
+import type { WorkerRunnerError } from './mod.ts'
+import { StaleInputError, WorkerRunner } from './mod.ts'
 
 type Input = { input: string; timeout: number }
 
@@ -35,16 +36,10 @@ Deno.test(WorkerRunner.name, async (t) => {
 		await assertResultsEqual(
 			runner,
 			[
-				'a',
-				{ input: 'b', timeout: 100 },
-				'c',
-				'd',
-			],
-			[
-				'A',
-				'B',
-				'C',
-				'D',
+				['a', 'A'],
+				['b', 'B'],
+				['c', 'C'],
+				['d', 'D'],
 			],
 		)
 	})
@@ -61,43 +56,56 @@ Deno.test(WorkerRunner.name, async (t) => {
 		await assertResultsEqual(
 			runner,
 			[
-				{ input: 'a', timeout: 100 },
-				'b',
-				'c',
-				'd',
-				'e',
-				'f',
-			],
-			[
-				'A',
-				'B',
-				new StaleInputError('Discarded stale input'),
-				new StaleInputError('Discarded stale input'),
-				new StaleInputError('Discarded stale input'),
-				'F',
+				// `a` ocupies worker 1/2
+				[{ delay: 0, input: 'a', timeout: 100 }, 'A'],
+				// `b` occupies worker 2/2
+				[{ delay: 0, input: 'b', timeout: 100 }, 'B'],
+				// `c` is invalidated as stale by `d` before `a` or `b` can complete
+				[{ delay: 0, input: 'c', timeout: 0 }, StaleInputError],
+				// workers become ready before `e` starts, so `d` is not marked stale
+				[{ delay: 0, input: 'd', timeout: 0 }, 'D'],
+				// `e` ocupies worker 1/2
+				[{ delay: 110, input: 'e', timeout: 100 }, 'E'],
+				// `f` occupies worker 2/2
+				[{ delay: 0, input: 'f', timeout: 100 }, 'F'],
+				// `g` is invalidated as stale by `h` before `e` or `f` can complete
+				[{ delay: 0, input: 'g', timeout: 0 }, StaleInputError],
+				// last input in the sequence always completes
+				[{ delay: 0, input: 'h', timeout: 0 }, 'H'],
 			],
 		)
 	})
 })
 
+type TestConfig = {
+	delay: number
+	input: string
+	timeout: number
+}
+
 async function assertResultsEqual(
 	runner: WorkerRunner<Input, string>,
-	inputs: (string | Input)[],
-	expected: (string | WorkerRunnerError)[],
+	tests: [
+		input: string | TestConfig,
+		expected: string | typeof WorkerRunnerError,
+	][],
 ) {
-	const actual = await Promise.all(inputs.map(async (x) => {
-		const val = await runner.call(
-			typeof x === 'string' ? { input: x, timeout: 0 } : x,
-		)
+	const inputs = tests.map((t) => t[0])
+	const expected = tests.map((t) => t[1])
 
-		return val.ok ? val.value : val.error
-	}))
+	const promises: Promise<typeof expected[number]>[] = []
 
-	for (const x of [...actual, ...expected]) {
-		if (Error.isError(x)) {
-			x.stack = x.stack?.replace(/(\n\s+at )[^]*/, '$1<truncated trace>')
-		}
+	for (const input of inputs) {
+		const config: TestConfig = typeof input === 'string' ? { delay: 0, input, timeout: 0 } : input
+
+		await new Promise((res) => setTimeout(res, config.delay))
+		const promise = runner.call(config)
+
+		promises.push((async () => {
+			const val = await promise
+			return val.ok ? val.value : val.error.constructor as typeof WorkerRunnerError
+		})())
 	}
 
-	assertEquals(actual, expected)
+	assertEquals(await Promise.all(promises), expected)
 }
