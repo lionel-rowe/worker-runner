@@ -1,13 +1,6 @@
-/**
- * @module
- * WorkerRunner module for managing a pool of workers to process inputs and produce outputs.
- */
-
 import { StaleInputError, TerminatedError, WorkerError, WorkerMessageError } from './errors.ts'
 import { WorkerSlot } from './slot.ts'
-export * from './errors.ts'
-
-const I32_MAX = 2 ** 31 - 1
+import { setTimeoutI32Safe } from './utils.ts'
 
 /** Options for configuring the WorkerRunner instance */
 export type WorkerRunnerOptions<I, O> = {
@@ -171,8 +164,4 @@ export class WorkerRunner<I, O> {
 		this.#pool.push(slot)
 		return slot
 	}
-}
-
-function setTimeoutI32Safe(fn: () => void, ms: number): number {
-	return ms > I32_MAX ? -1 : Number(setTimeout(fn, ms))
 }
