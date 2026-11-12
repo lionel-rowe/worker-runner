@@ -1,4 +1,4 @@
-import { StaleInputError, TerminatedError, WorkerError, WorkerMessageError, WorkerRunnerError } from './errors.ts'
+import { StaleInputError, TerminatedError, WorkerError, WorkerMessageError } from './errors.ts'
 import { WorkerSlot } from './slot.ts'
 export * from './errors.ts'
 
@@ -10,20 +10,6 @@ export type WorkerRunnerOptions<I, O> = {
 	skipStale: boolean
 	matches?: (input: I, output: O) => boolean
 }
-
-type Success<T> = {
-	ok: true
-	value: T
-}
-
-type Failure<E> = {
-	ok: false
-	error: E
-}
-
-export type Result<T, E> =
-	| Success<T>
-	| Failure<E>
 
 export class WorkerRunner<I, O> {
 	#createWorker: () => Worker | Promise<Worker>
@@ -52,7 +38,7 @@ export class WorkerRunner<I, O> {
 	}
 
 	#i = -1
-	async call(input: I): Promise<Result<O, WorkerRunnerError>> {
+	async call(input: I): Promise<O> {
 		const i = ++this.#i
 
 		let slot: WorkerSlot
@@ -70,10 +56,7 @@ export class WorkerRunner<I, O> {
 			const candidate = await this.#nextCandidate()
 
 			if (this.#options.skipStale && i !== this.#i) {
-				return {
-					ok: false,
-					error: new StaleInputError('Discarded stale input'),
-				}
+				throw new StaleInputError('Discarded stale input')
 			}
 
 			if (candidate.state === 'idle') {
@@ -92,20 +75,20 @@ export class WorkerRunner<I, O> {
 		const ac = new AbortController()
 		const { signal } = ac
 
-		return new Promise<Result<O, WorkerRunnerError>>((res) => {
+		return new Promise<O>((res, rej) => {
 			slot.terminated.then((reason) => {
-				res({ ok: false, error: new TerminatedError(reason) })
+				rej(new TerminatedError(reason))
 				ac.abort()
 			})
 
 			worker.addEventListener('error', (e) => {
-				res({ ok: false, error: new WorkerError(e.message) })
+				rej(new WorkerError(e.message))
 				ac.abort()
 				slot.terminate('Worker error')
 			}, { signal })
 
 			worker.addEventListener('messageerror', () => {
-				res({ ok: false, error: new WorkerMessageError('Message error') })
+				rej(new WorkerMessageError('Message error'))
 				ac.abort()
 				slot.terminate('Message error')
 			}, { signal })
@@ -121,7 +104,7 @@ export class WorkerRunner<I, O> {
 						slot.terminate('Idle timeout')
 					}, this.#options.idleTimeoutMs)
 
-					res({ ok: true, value: e.data })
+					res(e.data)
 					ac.abort()
 				}
 			}, { signal })

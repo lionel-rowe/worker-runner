@@ -102,8 +102,12 @@ async function assertResultsEqual(
 		const promise = runner.call(config)
 
 		promises.push((async () => {
-			const val = await promise
-			return val.ok ? val.value : val.error.constructor as typeof WorkerRunnerError
+			try {
+				return await promise
+			} catch (e) {
+				// deno-lint-ignore no-explicit-any
+				return (e as any).constructor as typeof WorkerRunnerError
+			}
 		})())
 	}
 
