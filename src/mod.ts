@@ -1,22 +1,51 @@
+/**
+ * @module
+ * WorkerRunner module for managing a pool of workers to process inputs and produce outputs.
+ */
+
 import { StaleInputError, TerminatedError, WorkerError, WorkerMessageError } from './errors.ts'
 import { WorkerSlot } from './slot.ts'
 export * from './errors.ts'
 
 const I32_MAX = 2 ** 31 - 1
 
+/** Options for configuring the WorkerRunner instance */
 export type WorkerRunnerOptions<I, O> = {
-	maxWorkers: number
-	idleTimeoutMs: number
-	invalidateStale: boolean
-	matches(input: I, output: O): boolean
+	/** The maximum number of workers to spawn at any one time */
+	maxWorkers?: number
+	/** Timeout in milliseconds before idle workers are terminated */
+	idleTimeoutMs?: number
+	/** Whether to invalidate (throw) on stale inputs when the worker pool is at capacity */
+	invalidateStale?: boolean
+	/**
+	 * Determine if a given output matches the input. Supplying this option is only necessary in either of the following
+	 * cases:
+	 * - The worker posts other types of messages that may not correspond to the input
+	 * - The worker does asynchronous processing that may result in outputs arriving out of order
+	 *
+	 * @param input The input value to match against
+	 * @param output The output value to check
+	 * @returns Whether the output matches the input
+	 */
+	matches?(input: I, output: O): boolean
 }
 
+/**
+ * A runner to manage and distribute work to a pool of workers to process inputs and produce outputs, optionally
+ * discarding stale workloads when the pool is at capacity.
+ *
+ * @example
+ * ```ts
+ * const runner = new WorkerRunner(() => new Worker('worker.js'))
+ * const output = await runner.call(input)
+ * ```
+ */
 export class WorkerRunner<I, O> {
 	#createWorker: () => Worker | Promise<Worker>
-	#options: WorkerRunnerOptions<I, O>
-	#slots: WorkerSlot[] = []
+	#options: Required<WorkerRunnerOptions<I, O>>
+	#pool: WorkerSlot[] = []
 
-	constructor(createWorker: () => Worker | Promise<Worker>, options?: Partial<WorkerRunnerOptions<I, O>>) {
+	constructor(createWorker: () => Worker | Promise<Worker>, options?: WorkerRunnerOptions<I, O>) {
 		this.#createWorker = createWorker
 		const matches = options?.matches?.bind(options) ?? (() => true)
 		this.#options = {
@@ -28,30 +57,44 @@ export class WorkerRunner<I, O> {
 		}
 	}
 
+	/**
+	 * Warm up the worker pool by spawning workers up to the specified number
+	 * @param numWorkers The number of workers to spawn
+	 */
 	warmup(numWorkers = 1) {
-		for (let i = this.#slots.length; i < numWorkers; ++i) {
+		for (let i = this.#pool.length; i < numWorkers; ++i) {
 			this.#addWorkerSlot()
 		}
 	}
 
+	/** Terminate all workers in the pool */
 	async terminateAll() {
-		for (const slot of [...this.#slots]) {
-			await slot.terminate('Terminate all')
+		for (const slot of [...this.#pool]) {
+			await slot.terminate('All workers terminated')
 		}
 	}
 
 	#i = -1
+	/**
+	 * Call the worker pool with the given input and return the output
+	 * @param input The input value to process
+	 * @returns The output produced by the worker
+	 * @throws {StaleInputError} If the input is discarded as stale (only when `invalidateStale` option is true)
+	 * @throws {TerminatedError} If the worker is terminated
+	 * @throws {WorkerError} If the worker encounters an error
+	 * @throws {WorkerMessageError} If the message to the worker cannot be processed
+	 */
 	async call(input: I): Promise<O> {
 		const i = ++this.#i
 
 		let slot: WorkerSlot
 		while (true) {
-			const idleSlot = this.#slots.find((x) => x.state === 'idle')
+			const idleSlot = this.#pool.find((x) => x.state === 'idle')
 			if (idleSlot) {
 				slot = idleSlot
 				break
 			}
-			if (this.#slots.length < this.#options.maxWorkers) {
+			if (this.#pool.length < this.#options.maxWorkers) {
 				slot = this.#addWorkerSlot()
 				break
 			}
@@ -115,17 +158,17 @@ export class WorkerRunner<I, O> {
 	}
 
 	#nextCandidate() {
-		return Promise.race(this.#slots.map((slot) => slot.idle.promise))
+		return Promise.race(this.#pool.map((slot) => slot.idle.promise))
 	}
 
 	#addWorkerSlot(): WorkerSlot {
 		const slot = new WorkerSlot(
-			this.#slots,
+			this.#pool,
 			Promise.resolve(this.#createWorker()),
 			Promise.withResolvers(),
 		)
 
-		this.#slots.push(slot)
+		this.#pool.push(slot)
 		return slot
 	}
 }
